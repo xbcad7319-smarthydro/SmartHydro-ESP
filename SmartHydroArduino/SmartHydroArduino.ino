@@ -1,21 +1,22 @@
 #include <SPI.h>
-#include <WiFiEsp.h>
-#include <WiFiEspClient.h>
-#include <WiFiEspServer.h>
+#include <WiFi.h>
 #include <DHT.h>
 #include "DFRobot_PH.h"
 #include "DFRobot_EC10.h"
 #include <arduino-timer.h>
 
-//HIGH IS LOW 
-//LOW IS HIGH
-//WE DON'T KNOW EITHER
-
 // WiFi network settings
-char ssid[] = "SmartHydro";       // newtork SSID (name). 8 or more characters
-char password[] = "Hydro123!";  // network password. 8 or more characters
+const char *ssid = "SmartHydro";              // newtork SSID (name). 8 or more characters
+const char *password = "Hydro123!";           // network password. 8 or more characters
+const IPAddress ESP_IP(192, 168, 8, 14);    // create an IP address
+const IPAddress SUBNET(255, 255, 255, 0);     // create an IP address
+const IPAddress LEASE_START(192, 168, 8, 20);  // create an IP address
+
+WiFiServer server(80);
+String header = "";
 String message = "";
 
+// AI
 #include "EC.h"
 #include "pH.h"
 #include "Humidity.h"
@@ -25,23 +26,22 @@ Eloquent::ML::Port::RandomForestpH ForestPH;
 Eloquent::ML::Port::RandomForestHumidity ForestHumidity;
 Eloquent::ML::Port::RandomForestTemperature ForestTemperature;
 
-WiFiEspServer server(80);
-RingBuffer buf(16);
-
-#define FLOW_PIN 52
-#define LIGHT_PIN A2
-#define EC_PIN A4
-#define PH_PIN A3
+#define FLOW_PIN 34
+#define LIGHT_PIN 35
+#define EC_PIN 36
+#define PH_PIN 39
+#define DHT_PIN 25
 #define DHTTYPE DHT22
-#define LED_PIN 9
-#define FAN_PIN 11
-#define PUMP_PIN 10
-#define EXTRACTOR_PIN 12  
-#define DHT_PIN 50
-#define PH_UP_PIN 5
-#define PH_DOWN_PIN 6
-#define EC_UP_PIN 7
-#define EC_DOWN_PIN 8
+
+#define LED_PIN 26
+#define FAN_PIN 27
+#define PUMP_PIN 14
+#define EXTRACTOR_PIN 32
+
+#define PH_UP_PIN 23
+#define PH_DOWN_PIN 22
+#define EC_UP_PIN 21
+#define EC_DOWN_PIN 19
 
 
 DFRobot_PH ph;
@@ -64,48 +64,40 @@ volatile int pulseCount = 0;
 unsigned long currentTime, cloopTime;
 
 void setup() {
-  Serial.begin(9600);
-  Serial1.begin(115200);
-  WiFi.init(&Serial1);  // Initialize ESP module using Serial1
-  
-  // Check for the presence of the ESP module
-  if (WiFi.status() == WL_NO_SHIELD) {
-    Serial.println("WiFi module not detected. Please check wiring and power.");
-    while (true)
-      ;  // Don't proceed further
-  }
+  Serial.begin(115200);
+  WiFi.mode(WIFI_MODE_AP);
+  WiFi.softAP(ssid, password);
+  //WiFi.softAPConfig(ESP_IP, SUBNET, ESP_IP, LEASE_START);
+  //WiFi.setHostname("SmartHydro-Tent");
 
-  Serial.print("Attempting to start AP ");
-  Serial.println(ssid);
-
-  IPAddress localIp(192, 168, 8, 14);  // create an IP address
-  WiFi.configAP(localIp);              // set the IP address of the AP
-
-  // start access point
-  // channel is the number. Ranges from 1-14, defaults to 1
-  // last comma is encryption type
-  WiFi.beginAP(ssid, 11, password, ENC_TYPE_WPA2_PSK);
-
-  Serial.print("Access point started");
+  Serial.println("Access point started");
 
   // Start the server
   server.begin();
   ec.begin();
   dht.begin();
   ph.begin();
+  Serial.println("Sensors started");
 
-  pinMode(FLOW_PIN, INPUT);
+  pinMode(26, OUTPUT);
+  pinMode(27, OUTPUT);
+  pinMode(14, OUTPUT);
+  pinMode(32, OUTPUT);
 
-   attachInterrupt(0, incrementPulseCounter, RISING);
-   sei();
+  pinMode(23, OUTPUT);
+  pinMode(22, OUTPUT);
+  pinMode(21, OUTPUT);
+  pinMode(19, OUTPUT);
 
-    for (int i = 3; i < 13; i++)
-     {
-      if (i != 8) {
-        pinMode(i, OUTPUT);
-        togglePin(i);
-      }
-     }
+  pinMode(34, INPUT);
+  pinMode(35, INPUT);
+  pinMode(36, INPUT);
+  pinMode(39, INPUT);
+  pinMode(25, INPUT);
+  attachInterrupt(0, incrementPulseCounter, RISING);
+  sei();
+
+  Serial.println("Pins configured");
 
   // turning on equipment that should be on by default
   togglePin(LED_PIN);
@@ -113,19 +105,19 @@ void setup() {
   togglePin(PUMP_PIN);
   togglePin(EXTRACTOR_PIN);
 
-  Serial.println("Server started");
-  timer.every(5000, estimateTemperature);
-  timer.every(5000, estimateHumidity);
-  timer.every(SIXTEEN_HR, estimateEC);
-  timer.every(SIXTEEN_HR, estimatePH);
-
-  toggleLightOn(); 
+  timer.every(5000, (bool (*)(void *))estimateTemperature);
+  timer.every(5000, (bool (*)(void *))estimateHumidity);
+  timer.every(SIXTEEN_HR, (bool (*)(void *))estimateEC);
+  timer.every(SIXTEEN_HR, (bool (*)(void *))estimatePH);
+  Serial.println("Timers set");
+  Serial.println(WiFi.softAPIP());
+  toggleLightOn();
 }
 
 
 void loop() {
-  WiFiEspClient client = server.available();  // Check if a client has connected
-
+  WiFiClient client = server.available();  // Check if a client has connected
+  header = "";
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
   lightLevel = getLightLevel();
@@ -136,73 +128,74 @@ void loop() {
   timer.tick();
 
   if (client) {  // If a client is available
-    buf.init();
     message = "";
     while (client.connected()) {  // Loop while the client is connected
       if (client.available()) {   // Check if data is available from the client
         char c = client.read();
         //Serial.write(c); // Echo received data to Serial Monitor
-        buf.push(c);
+        header += c;
         // you got two newline characters in a row
         // that's the end of the HTTP request, so send a response
-        if (buf.endsWith("\r\n\r\n")) {
-          message = "{\n  \"PH\": \"" + String(phLevel) + "\",\n \"Light\": \"" + String(lightLevel) +  "\",\n  \"EC\": \"" + String(ecLevel) + "\",\n  \"FlowRate\": \"" + String(flowRate) + "\",\n  \"Humidity\": \"" + String(humidity) + "\",\n  \"Temperature\": \"" + String(temperature) +  "\"\n }"; 
-          ec.calibration(ecLevel, temperature); 
+        if (header.indexOf("/sensors") > 0) {
+          message = "{\n  \"PH\": \"" + String(phLevel) + "\",\n  \"Light\": \"" + String(lightLevel) + "\",\n  \"EC\": \"" + String(ecLevel) + "\",\n  \"FlowRate\": \"" + String(flowRate) + "\",\n  \"Humidity\": \"" + String(humidity) + "\",\n  \"Temperature\": \"" + String(temperature) + "\"\n }";
+          ec.calibration(ecLevel, temperature);
 
           sendHttpResponse(client, message);
           break;
         }
 
-        if (buf.endsWith("/light")) {
+        if (header.indexOf("/light") > 0) {
           togglePin(LED_PIN);
-        } 
+        }
 
-        if (buf.endsWith("/fan")) {
+        if (header.indexOf("/fan") > 0) {
           togglePin(FAN_PIN);
-        } 
+        }
 
-        if (buf.endsWith("/extract")) {
+        if (header.indexOf("/extract") > 0) {
           togglePin(EXTRACTOR_PIN);
-        } 
+        }
 
-        if (buf.endsWith("/pump")) {
+        if (header.indexOf("/pump") > 0) {
           togglePin(PUMP_PIN);
-        } 
+        }
 
-        if (buf.endsWith("/phUp")) {
+        if (header.indexOf("/phUp") > 0) {
           togglePin(PH_DOWN_PIN, LOW);
           togglePin(PH_UP_PIN, HIGH);
-          timer.in(PUMP_INTERVAL, disablePH);
+          timer.in(PUMP_INTERVAL, (bool (*)(void *))disablePH);
         }
 
-        if (buf.endsWith("/phDown")) {
+        if (header.indexOf("/phDown") > 0) {
           togglePin(PH_UP_PIN, LOW);
           togglePin(PH_DOWN_PIN, HIGH);
-          timer.in(PUMP_INTERVAL, disablePH);
+          timer.in(PUMP_INTERVAL, (bool (*)(void *))disablePH);
         }
 
-        if (buf.endsWith("/ecUp")) {
+        if (header.indexOf("/ecUp") > 0) {
           togglePin(EC_DOWN_PIN, LOW);
           togglePin(EC_UP_PIN, HIGH);
-          timer.in(PUMP_INTERVAL, disableEC);
+          timer.in(PUMP_INTERVAL, (bool (*)(void *))disableEC);
         }
 
-        if (buf.endsWith("/ecDown")) {
+        if (header.indexOf("/ecDown") > 0) {
           togglePin(EC_UP_PIN, LOW);
           togglePin(EC_DOWN_PIN, HIGH);
-          timer.in(PUMP_INTERVAL, disableEC);
+          timer.in(PUMP_INTERVAL, (bool (*)(void *))disableEC);
         }
 
-        if (buf.endsWith("/ph")) {
+        if (header.indexOf("/ph") > 0) {
           disablePH();
         }
 
-        if (buf.endsWith("/ec")) {
+        if (header.indexOf("/ec") > 0) {
           disableEC();
         }
 
-        if (buf.endsWith("/components")) {
-          message = "{\n  \"PHPump\": \"" + String(digitalRead(PH_UP_PIN)) + "\",\n \"Light\": \"" + String(digitalRead(LIGHT_PIN)) +  "\",\n  \"ECPump\": \"" + String(EC_UP_PIN) + "\",\n  \"WaterPump\": \"" + String(digitalRead(PUMP_PIN)) + "\",\n  \"Exctractor\": \"" + String(digitalRead(EXTRACTOR_PIN)) + "\",\n  \"Fan\": \"" + String(digitalRead(FAN_PIN)) +  "\"\n }"; 
+        if (header.indexOf("/components") > 0) {
+          message = "{\n  \"PHPump\": \"" + String(digitalRead(PH_UP_PIN)) + "\",\n  \"Light\": \"" + String(digitalRead(LIGHT_PIN)) + "\",\n  \"ECPump\": \"" + String(digitalRead(EC_UP_PIN)) + "\",\n  \"WaterPump\": \"" + String(digitalRead(PUMP_PIN)) + "\",\n  \"Exctractor\": \"" + String(digitalRead(EXTRACTOR_PIN)) + "\",\n  \"Fan\": \"" + String(digitalRead(FAN_PIN)) + "\"\n }";
+
+          sendHttpResponse(client, message);
         }
       }
     }
@@ -212,7 +205,7 @@ void loop() {
 }
 
 
-  /**
+/**
   * Inverts the reading of a pin.
   */
 void togglePin(int pin) {
@@ -223,11 +216,11 @@ void togglePin(int pin, int toggleValue) {
   digitalWrite(pin, toggleValue);
 }
 
-  /**
+/**
   * Sends a http response along with a message.
   */
-void sendHttpResponse(WiFiEspClient client, String message) {
-    client.print(
+void sendHttpResponse(WiFiClient client, String message) {
+  client.print(
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: application/json\r\n"
     "Connection: close\r\n");
@@ -244,66 +237,61 @@ float getLightLevel() {
 }
 
 float getEC() {
-  float ecVoltage = (float)analogRead(EC_PIN)/1024.0*5000.0; 
+  float ecVoltage = (float)analogRead(EC_PIN) / 1024.0 * 5000.0;
   return ec.readEC(ecVoltage, temperature);
 }
 
 float getPH() {
-  float phVoltage = analogRead(PH_PIN)/1024.0*5000; 
+  float phVoltage = analogRead(PH_PIN) / 1024.0 * 5000;
   return ph.readPH(phVoltage, temperature);
 }
 
-void setComponent(int result, int pin, int status){
-    if (result == 0) { // Below Optimal
-    if (status == 1){
-    digitalWrite(pin, LOW);
-    //Serial.println("FAN offfffff");
-    } 
-  }
-  else if (result == 1) { // Above Optimal
-    if (status == 0){
+void setComponent(int result, int pin, int status) {
+  if (result == 0) {  // Below Optimal
+    if (status == 1) {
+      digitalWrite(pin, LOW);
+      //Serial.println("FAN offfffff");
+    }
+  } else if (result == 1) {  // Above Optimal
+    if (status == 0) {
       digitalWrite(pin, HIGH);
       //Serial.println("FAN ON");
-    } 
-  }
-  else {
-     if (status == 0){ //Optimal 
-      Serial.println("Component: "+ digitalRead(pin));
+    }
+  } else {
+    if (status == 0) {  //Optimal
+      Serial.println("Component: " + digitalRead(pin));
       togglePin(pin);
-      //Serial.println("COMPONENT OFF!!!!!!!");    
+      //Serial.println("COMPONENT OFF!!!!!!!");
     }
   }
 }
 
-void setPump(int result, int pinUp, int pinDown, int statusUp,int statusDown){
-    if (result == 0) { //Below Optimal
-    if (statusUp == 1 || statusDown == 0){
-    digitalWrite(pinUp, LOW);
-    digitalWrite(pinDown, HIGH);
-    Serial.println("pump up offfffff");
-    } 
-  }
-  else if (result == 1) { //Above Optimal
-    if (statusUp == 0 || statusDown == 1){
+void setPump(int result, int pinUp, int pinDown, int statusUp, int statusDown) {
+  if (result == 0) {  //Below Optimal
+    if (statusUp == 1 || statusDown == 0) {
+      digitalWrite(pinUp, LOW);
+      digitalWrite(pinDown, HIGH);
+      Serial.println("pump up offfffff");
+    }
+  } else if (result == 1) {  //Above Optimal
+    if (statusUp == 0 || statusDown == 1) {
       digitalWrite(pinUp, HIGH);
       digitalWrite(pinDown, LOW);
       Serial.println("pump down on");
-    } 
-  }
-  else {
-     
-      Serial.println("Component: " + digitalRead(pinUp));
-      Serial.println("Component: " + digitalRead(pinDown));
-      
-      togglePin(pinUp, HIGH);
-      togglePin(pinDown, HIGH);
-      Serial.println("COMPONENTS OFF!");    
-    
+    }
+  } else {
+
+    Serial.println("Component: " + digitalRead(pinUp));
+    Serial.println("Component: " + digitalRead(pinDown));
+
+    togglePin(pinUp, HIGH);
+    togglePin(pinDown, HIGH);
+    Serial.println("COMPONENTS OFF!");
   }
 }
 
 void estimateTemperature() {
-  if(temperature != NAN){
+  if (temperature != NAN) {
     int result = ForestTemperature.predict(&temperature);
     int fanStatus = digitalRead(FAN_PIN);
     int lightStatus = digitalRead(LIGHT_PIN);
@@ -311,11 +299,10 @@ void estimateTemperature() {
 
     setComponent(result, FAN_PIN, fanStatus);
   }
-  
 }
 
 void estimateHumidity() {
-  if(humidity != NAN){
+  if (humidity != NAN) {
     int result = ForestHumidity.predict(&humidity);
     int extractorStatus = digitalRead(EXTRACTOR_PIN);
 
@@ -324,26 +311,25 @@ void estimateHumidity() {
 }
 
 void estimatePH() {
-  if(phLevel != NAN){
+  if (phLevel != NAN) {
     int result = ForestPH.predict(&phLevel);
     int phUpStatus = digitalRead(PH_UP_PIN);
     int phDownStatus = digitalRead(PH_DOWN_PIN);
 
     setPump(result, PH_UP_PIN, PH_DOWN_PIN, phUpStatus, phDownStatus);
-    timer.in(PUMP_INTERVAL, disablePH);
+    timer.in(PUMP_INTERVAL, (bool (*)(void *))disablePH);
   }
 }
 
 void estimateEC() {
-  if(ecLevel != NAN){
+  if (ecLevel != NAN) {
     int result = ForestEC.predict(&ecLevel);
     int ecUpStatus = digitalRead(EC_UP_PIN);
     int ecDownStatus = digitalRead(EC_DOWN_PIN);
 
     setPump(result, EC_UP_PIN, EC_DOWN_PIN, ecUpStatus, ecDownStatus);
-    timer.in(PUMP_INTERVAL, disableEC);
+    timer.in(PUMP_INTERVAL, (bool (*)(void *))disableEC);
   }
-  
 }
 
 void estimateFactors() {
@@ -381,13 +367,10 @@ float getFlowRate() {
 
 void toggleLightOn() {
   togglePin(LED_PIN, LOW);
-  timer.in(EIGHT_HR, toggleLightOff);
+  timer.in(EIGHT_HR, (bool (*)(void *))toggleLightOff);
 }
 
 void toggleLightOff() {
   togglePin(LED_PIN, HIGH);
-  timer.in(FOUR_HR, toggleLightOn);
+  timer.in(FOUR_HR, (bool (*)(void *))toggleLightOn);
 }
-
-
-
